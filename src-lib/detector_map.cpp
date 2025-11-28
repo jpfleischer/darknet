@@ -761,198 +761,192 @@ float validate_detector_map(const char * datacfg, const char * cfgfile, const ch
 				return lhs.probability > rhs.probability;
 			});
 
-	struct pr_t
-	{
-		double prob			= 0.0;
-		double precision	= 0.0;
-		double recall		= 0.0;
-		int tp				= 0;
-		int tn				= 0;
-		int fp				= 0;
-		int fn				= 0;
-	};
-
-	/* for the precision-recall (PR) curve
-	 *
-	 * Note this is a pointer-to-a-pointer.  We don't have just 1 of these per class, but these exist for every
-	 * prediction...which can be quite big depending on the dataset.
-	 */
-	pr_t** pr = (pr_t**)xcalloc(shared_info.number_of_classes, sizeof(pr_t*));
-	for (int i = 0; i < shared_info.number_of_classes and cfg_and_state.must_immediately_exit == false; ++i)
-	{
-		pr[i] = (pr_t*)xcalloc(std::max(size_t(1), shared_info.box_probabilities.size()), sizeof(pr_t)); // allocate at least 1 to avoid nullptr deref
-	}
-
-	*cfg_and_state.output << "detections_count=" << shared_info.box_probabilities.size() << ", unique_truth_count=" << shared_info.unique_truth_count << std::endl;
-
-	int *truth_flags = (int*)xcalloc(std::max(1, shared_info.unique_truth_count), sizeof(int));
-
-	// Accumulate PR for each rank
-	for (int rank = 0; rank < shared_info.box_probabilities.size() and cfg_and_state.must_immediately_exit == false; ++rank)
-	{
-		if (rank % 100 == 0)
-		{
-			*cfg_and_state.output << "\rrank=" << rank << " of ranks=" << shared_info.box_probabilities.size() << std::flush;
-		}
-
-		if (rank > 0)
-		{
-			for (int class_id = 0; class_id < shared_info.number_of_classes and cfg_and_state.must_immediately_exit == false; ++class_id)
-			{
-				pr[class_id][rank].tp = pr[class_id][rank - 1].tp;
-				pr[class_id][rank].fp = pr[class_id][rank - 1].fp;
-				pr[class_id][rank].tn = pr[class_id][rank - 1].tn;
-				pr[class_id][rank].fn = pr[class_id][rank - 1].fn;
-			}
-		}
-
-		const BoxProbability & d = shared_info.box_probabilities[rank];
-		pr[d.class_id][rank].prob = d.probability;
-
-		if (d.matched_ground_truth)
-		{
-			if (d.unique_truth_index >= 0 and d.unique_truth_index < shared_info.unique_truth_count and truth_flags[d.unique_truth_index] == 0)
-			{
-				truth_flags[d.unique_truth_index] = 1;
-				pr[d.class_id][rank].tp++; // true positive
-			}
-			else
-			{
-				pr[d.class_id][rank].fp++; // duplicate hit on same GT
-			}
-		}
-		else
-		{
-			pr[d.class_id][rank].fp++;    // false-positive
-		}
-
-		for (int i = 0; i < shared_info.number_of_classes and cfg_and_state.must_immediately_exit == false; ++i)
-		{
-			const int tp = pr[i][rank].tp;
-			const int fp = pr[i][rank].fp;
-//			const int tn = pr[i][rank].tn;
-			const int fn = shared_info.ground_truth_counts[i] - tp; // remaining GT are false negatives
-			pr[i][rank].fn = fn;
-			pr[i][rank].precision	= (tp + fp) > 0 ? (double)tp / (double)(tp + fp) : 0.0;
-			pr[i][rank].recall		= (tp + fn) > 0 ? (double)tp / (double)(tp + fn) : 0.0;
-
-			if (rank == (shared_info.box_probabilities.size() - 1) and shared_info.prediction_counts[i] != (tp + fp))
-			{
-				// check for last rank
-				*cfg_and_state.output
-					<< "class_id="		<< i
-					<< ", detections="	<< shared_info.prediction_counts[i]
-					<< ", tp+fp="		<< tp + fp
-					<< ", tp="			<< tp
-					<< ", fp="			<< fp
-					<< std::endl;
-			}
-		}
-	}
-
-	free(truth_flags);
+	*cfg_and_state.output
+		<< "detections_count=" << shared_info.box_probabilities.size()
+		<< ", unique_truth_count=" << shared_info.unique_truth_count
+		<< std::endl;
 
 	double mean_average_precision = 0.0;
 
 	// ---- Per-class AP + reporting (no TN/accuracy/specificity) ----
-	for (int class_idx = 0; class_idx < shared_info.number_of_classes and cfg_and_state.must_immediately_exit == false; ++class_idx)
+	for (int class_idx = 0;
+		 class_idx < shared_info.number_of_classes && cfg_and_state.must_immediately_exit == false;
+		 ++class_idx)
 	{
+		const int gt_i = static_cast<int>(shared_info.ground_truth_counts[class_idx]);
+
+		// One truth_flags array per class, indexed by global unique_truth_index.
+		// Only indices referenced by this class's detections will be touched.
+		std::vector<int> truth_flags(shared_info.unique_truth_count, 0);
+
+		int tp = 0;
+		int fp = 0;
+
+		std::vector<double> prec_hist;
+		std::vector<double> rec_hist;
+		prec_hist.reserve(shared_info.prediction_counts[class_idx]);
+		rec_hist.reserve(shared_info.prediction_counts[class_idx]);
+
+		// Walk detections in descending probability, but only those of this class.
+		for (size_t rank = 0;
+			 rank < shared_info.box_probabilities.size() && cfg_and_state.must_immediately_exit == false;
+			 ++rank)
+		{
+			const BoxProbability &d = shared_info.box_probabilities[rank];
+
+			if (d.class_id != class_idx)
+			{
+				continue;
+			}
+
+			if (d.matched_ground_truth &&
+				d.unique_truth_index >= 0 &&
+				d.unique_truth_index < static_cast<int>(shared_info.unique_truth_count))
+			{
+				if (truth_flags[d.unique_truth_index] == 0)
+				{
+					truth_flags[d.unique_truth_index] = 1;
+					++tp; // true positive
+				}
+				else
+				{
+					++fp; // duplicate hit on same GT
+				}
+			}
+			else
+			{
+				++fp; // false positive
+			}
+
+			const int det_denom = tp + fp;
+			const double precision =
+				(det_denom > 0) ? static_cast<double>(tp) / static_cast<double>(det_denom) : 0.0;
+			const double recall =
+				(gt_i > 0) ? static_cast<double>(tp) / static_cast<double>(gt_i) : 0.0;
+
+			prec_hist.push_back(precision);
+			rec_hist.push_back(recall);
+		}
+
+		// Optional diagnostic check like the old "tp+fp vs detections" print
+		if (shared_info.prediction_counts[class_idx] != static_cast<size_t>(tp + fp))
+		{
+			*cfg_and_state.output
+				<< "class_id=" << class_idx
+				<< ", detections=" << shared_info.prediction_counts[class_idx]
+				<< ", tp+fp=" << (tp + fp)
+				<< ", tp=" << tp
+				<< ", fp=" << fp
+				<< std::endl;
+		}
+
+		// --- Compute AP for this class from (rec_hist, prec_hist) ---
 		double avg_precision = 0.0;
 
-		// MS COCO - uses 101-Recall-points on PR-chart.
-		// PascalVOC2007 - uses 11-Recall-points on PR-chart.
-		// PascalVOC2010-2012 - uses Area-Under-Curve on PR-chart.
-		// ImageNet - uses Area-Under-Curve on PR-chart.
-
-		// correct mAP calculation: ImageNet, PascalVOC 2010-2012
-		const int gt_i = shared_info.ground_truth_counts[class_idx];
-
-		if (shared_info.box_probabilities.empty())
+		if (!prec_hist.empty())
 		{
-			// No detections at all -> AP remains 0 (unless you prefer to skip classes with gt_i==0)
-		}
-		else if (map_points == 0) // this is the default functionality, map_points == 0
-		{
-			// VOC2010 / AUC of the precision envelope
-			double last_recall = pr[class_idx][shared_info.box_probabilities.size() - 1].recall;
-			double last_precision = pr[class_idx][shared_info.box_probabilities.size() - 1].precision;
-			for (int rank = shared_info.box_probabilities.size() - 2; rank >= 0 and cfg_and_state.must_immediately_exit == false; --rank)
+			if (map_points == 0)
 			{
-				double delta_recall = last_recall - pr[class_idx][rank].recall;
-				last_recall = pr[class_idx][rank].recall;
+				// VOC2010 / AUC of precision envelope
+				double last_recall = rec_hist.back();
+				double last_precision = prec_hist.back();
 
-				if (pr[class_idx][rank].precision > last_precision)
+				for (int k = static_cast<int>(prec_hist.size()) - 2;
+					 k >= 0 && cfg_and_state.must_immediately_exit == false;
+					 --k)
 				{
-					last_precision = pr[class_idx][rank].precision;
+					const double delta_recall = last_recall - rec_hist[k];
+					last_recall = rec_hist[k];
+
+					if (prec_hist[k] > last_precision)
+					{
+						last_precision = prec_hist[k];
+					}
+
+					avg_precision += delta_recall * last_precision;
 				}
 
+				// Remaining area down to recall=0
+				const double delta_recall = last_recall - 0.0;
 				avg_precision += delta_recall * last_precision;
 			}
-			//add remaining area of PR curve when recall isn't 0 at rank-1
-			double delta_recall = last_recall - 0.0;
-			avg_precision += delta_recall * last_precision;
-		}
-		else
-		{
-			// Sampled AP (VOC2007 11-pt, or COCO-style 101-pt sampling at a SINGLE IoU)
-			if (map_points < 2)
+			else
 			{
-				darknet_fatal_error(DARKNET_LOC, "map_points must be >= 2 (e.g., 11 or 101).");
-			}
-
-			for (int point = 0; point < map_points and cfg_and_state.must_immediately_exit == false; ++point)
-			{
-				double cur_recall = (map_points == 1) ? 0.0 : (point * 1.0 / (map_points - 1));
-				double cur_precision = 0.0;
-				for (int rank = 0; rank < shared_info.box_probabilities.size() and cfg_and_state.must_immediately_exit == false; ++rank)
+				// Sampled AP (VOC2007 11-pt, or COCO-style 101-pt)
+				if (map_points < 2)
 				{
-					if (pr[class_idx][rank].recall		>= cur_recall and
-						pr[class_idx][rank].precision	> cur_precision)
-					{
-						cur_precision = pr[class_idx][rank].precision;
-					}
+					darknet_fatal_error(DARKNET_LOC, "map_points must be >= 2 (e.g., 11 or 101).");
 				}
-				avg_precision += cur_precision;
+
+				for (int point = 0;
+					 point < map_points && cfg_and_state.must_immediately_exit == false;
+					 ++point)
+				{
+					const double cur_recall =
+						(map_points == 1)
+							? 0.0
+							: (static_cast<double>(point) / static_cast<double>(map_points - 1));
+
+					double cur_precision = 0.0;
+
+					for (size_t k = 0;
+						 k < prec_hist.size() && cfg_and_state.must_immediately_exit == false;
+						 ++k)
+					{
+						if (rec_hist[k] >= cur_recall && prec_hist[k] > cur_precision)
+						{
+							cur_precision = prec_hist[k];
+						}
+					}
+
+					avg_precision += cur_precision;
+				}
+
+				avg_precision /= map_points;
 			}
-			avg_precision = avg_precision / map_points;
 		}
 
-		// ---- Per-class stats at the SAME conf_thresh as global F1 ----
-		const int tp = shared_info.tp_for_thresh_per_class[class_idx];
-		const int fp = shared_info.fp_for_thresh_per_class[class_idx];
-		const int fn = std::max(0, gt_i - tp);
+		// ---- Per-class stats at the SAME conf_thresh as global F1 (unchanged) ----
+		const int tp_diag = shared_info.tp_for_thresh_per_class[class_idx];
+		const int fp_diag = shared_info.fp_for_thresh_per_class[class_idx];
+		const int fn_diag = std::max(0, gt_i - tp_diag);
 
-		const float diag_avg_iou_at_thresh = (shared_info.tp_for_thresh_per_class[class_idx] + shared_info.fp_for_thresh_per_class[class_idx]) > 0 ? shared_info.avg_iou_per_class[class_idx] : 0.0f;
+		const float diag_avg_iou_at_thresh =
+			(shared_info.tp_for_thresh_per_class[class_idx] +
+			 shared_info.fp_for_thresh_per_class[class_idx]) > 0
+				? shared_info.avg_iou_per_class[class_idx]
+				: 0.0f;
 
-		float precision	= 0.0f;
-		float recall	= 0.0f;
-		float f1		= 0.0f;
+		float precision_f1 = 0.0f;
+		float recall_f1 = 0.0f;
+		float f1 = 0.0f;
 
-		if (tp + fp > 0)
+		if (tp_diag + fp_diag > 0)
 		{
-			precision = static_cast<float>(tp) / static_cast<float>(tp + fp);
+			precision_f1 =
+				static_cast<float>(tp_diag) / static_cast<float>(tp_diag + fp_diag);
 		}
 		if (gt_i > 0)
 		{
-			recall = static_cast<float>(tp) / static_cast<float>(gt_i);
+			recall_f1 = static_cast<float>(tp_diag) / static_cast<float>(gt_i);
 		}
-		if (precision + recall > 0.0f)
+		if (precision_f1 + recall_f1 > 0.0f)
 		{
-			f1 = 2.0f * precision * recall / (precision + recall);
+			f1 = 2.0f * precision_f1 * recall_f1 / (precision_f1 + recall_f1);
 		}
 
 		*cfg_and_state.output
 			<< Darknet::format_map_ap_row_values(
-				class_idx,											// class_id
-				shared_info.net.details->class_names[class_idx],	// name
-				static_cast<float>(avg_precision),					// AP (threshold-free)
-				tp,													// TP @ conf_thresh
-				0,													// TN (not shown)
-				fp,													// FP @ conf_thresh
-				fn,													// FN @ conf_thresh
-				gt_i,												// GT
-				f1,													// F1 @ conf_thresh
-				diag_avg_iou_at_thresh)								// diag IoU @ conf_thresh
+				   class_idx,										// class_id
+				   shared_info.net.details->class_names[class_idx], // name
+				   static_cast<float>(avg_precision),				// AP (threshold-free)
+				   tp_diag,											// TP @ conf_thresh
+				   0,												// TN (not shown)
+				   fp_diag,											// FP @ conf_thresh
+				   fn_diag,											// FN @ conf_thresh
+				   gt_i,											// GT
+				   f1,												// F1 @ conf_thresh
+				   diag_avg_iou_at_thresh)							// diag IoU @ conf_thresh
 			<< std::endl;
 
 		// send the result of this class to the C++ side of things so we can include it the right chart
@@ -1013,13 +1007,6 @@ float validate_detector_map(const char * datacfg, const char * cfgfile, const ch
 		<< std::endl;
 
 	Darknet::update_f1_in_new_charts(-1, f1_score);
-
-	// free memory
-	for (int i = 0; i < shared_info.number_of_classes; ++i)
-	{
-		free(pr[i]);
-	}
-	free(pr);
 
 	const auto timestamp_end = std::chrono::high_resolution_clock::now();
 
